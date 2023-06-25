@@ -60,6 +60,90 @@ iirc these files are supposed to track different identity type session changes. 
 referenced across all events which should corelate more or less to the principal or entity(?) as well as tracked edges between different principal/entity session keys
 as a result of a specific event log (assumerole, etc..).
 
+## Session key and session relationships
+
+How ctail works basically comes down to these two snippets.
+
+For events that result in a session change we normalize some stuff to an intermidiate object that contains the stuff used to identify future sessions:
+
+```
+	switch e.EventName {
+	case "ConsoleLogin":
+		//
+		// The ARN issuer will stay the same when ConsoleLogin is called from a role. See the role-console-login.json
+		// file for an example.
+		//
+		// This likely doesn't cover other cases of ConsoleLogin.
+		//
+		id.Arn = e.UserIdentity.SessionContext.SessionIssuer.Arn
+	case "AssumeRole":
+		//
+		// TODO: Check sharedEventID
+		//
+		id.Type = "AssumedRole"
+		id.Arn = e.ResponseElements.AssumedRoleUser.Arn
+		id.AccessKeyId = e.ResponseElements.Credentials.AccessKeyId
+
+		//
+		// Skip cross-account assume role events for now if this event isn't from the source account. If the
+		// target account event Identity happens to be returned first it causes subsequent sessions to have the
+		// original identity of the source account rather than the source user in the source account.
+		//
+		// TODO: This breaks when we don't have access to the source account.
+		//
+		if e.UserIdentity.AccountId != e.RecipientAccountId {
+			return nil
+		}
+	case "GetFederationToken":
+		id.Type = "FederatedUser"
+		id.Arn = e.ResponseElements.FederatedUser.Arn
+		id.AccessKeyId = e.ResponseElements.Credentials.AccessKeyId
+	}
+```
+
+Both the above internal representation, and future events can then be reduced to a session ID key:
+
+```
+	switch i.Type {
+	case "IAMUser":
+		// IAMUser::12346789012:AIDAXXXXXXXXXXXXXXXXX:me
+		id = fmt.Sprintf("%s:%s:%s:%s:%s", i.Type, i.InvokedBy, i.AccountId, resourceId, i.UserName)
+	case "AssumedRole":
+		// AssumedRole::arn:aws:sts::123456789012:assumed-role/test2/XX:ASIAXXXXXXXXXXXXXXXX:1664688868
+		id = fmt.Sprintf("%s:%s:%s:%s:%d", i.Type, i.InvokedBy, i.Arn, i.AccessKeyId, i.SessionContext.Attributes.CreationDate.Unix())
+
+		//
+		// TODO: Cover ConsoleLogin from assume-role source. This is difficult because we can only identify the
+		//   resulting session based on the original session arn and the creation time, there is no access
+		//   key in there response. We also can't identify if the source should be a ConsoleLogin call.
+		//
+	case "AWSAccount":
+		// To actually reliably track sessions across accounts we need to use the sharedEventId.
+		//
+		// Can be in either of the following formats:
+		//   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX
+                //   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX:botocore-session-1661553185
+		id = fmt.Sprintf("%s:%s:%s", i.Type, i.AccountId, i.PrincipalId)
+	case "AWSService":
+		// Consolidate sessions that originate from AWS Services, they create too many unique sessions.
+		//
+		// AWSService:codepipeline.amazonaws.com
+		id = fmt.Sprintf("%s:%s", i.Type, i.InvokedBy)
+	case "FederatedUser":
+		// TODO: Ensure Source can match this
+		id = fmt.Sprintf("%s:%s:%s:%s:%d", i.Type, i.InvokedBy, i.Arn, i.AccessKeyId, i.SessionContext.Attributes.CreationDate.Unix())
+	default:
+		panic("unknown user identity type")
+
+	// AwsConsoleSignIn event type will not have a SessionContext
+```
+
+With the original session key and target key a session stream will look like:
+
+Event1.Id(): AWSAccount::<acct-id>:AIDA...
+Event1.Target(): AWSAccount::<acct-id>:AIDA... -> AssumedRole::<arn>:ASIA...:<unix timestamp>
+Event2.Id(): AssumedRole::<arn>:ASIA...:<unix timestamp>
+
 ### SessionContext field
 
 ```
@@ -225,80 +309,6 @@ type UserIdentity struct {
 	//     * These events are created by AWS services but are not directly triggered by a request to a public AWS API.
 	//     * https://docs.aws.amazon.com/awscloudtrail/latest/userguide/non-api-aws-service-events.html
 	EventType string `json:"eventType,omitempty"`
-```
-
-### EventNames field
-
-```
-	switch e.EventName {
-	case "ConsoleLogin":
-		//
-		// The ARN issuer will stay the same when ConsoleLogin is called from a role. See the role-console-login.json
-		// file for an example.
-		//
-		// This likely doesn't cover other cases of ConsoleLogin.
-		//
-		id.Arn = e.UserIdentity.SessionContext.SessionIssuer.Arn
-	case "AssumeRole":
-		//
-		// TODO: Check sharedEventID
-		//
-		id.Type = "AssumedRole"
-		id.Arn = e.ResponseElements.AssumedRoleUser.Arn
-		id.AccessKeyId = e.ResponseElements.Credentials.AccessKeyId
-
-		//
-		// Skip cross-account assume role events for now if this event isn't from the source account. If the
-		// target account event Identity happens to be returned first it causes subsequent sessions to have the
-		// original identity of the source account rather than the source user in the source account.
-		//
-		// TODO: This breaks when we don't have access to the source account.
-		//
-		if e.UserIdentity.AccountId != e.RecipientAccountId {
-			return nil
-		}
-	case "GetFederationToken":
-		id.Type = "FederatedUser"
-		id.Arn = e.ResponseElements.FederatedUser.Arn
-		id.AccessKeyId = e.ResponseElements.Credentials.AccessKeyId
-	}
-```
-
-### UserIdentity.Type field
-
-```
-	switch i.Type {
-	case "IAMUser":
-		// IAMUser::12346789012:AIDAXXXXXXXXXXXXXXXXX:me
-		id = fmt.Sprintf("%s:%s:%s:%s:%s", i.Type, i.InvokedBy, i.AccountId, resourceId, i.UserName)
-	case "AssumedRole":
-		// AssumedRole::arn:aws:sts::123456789012:assumed-role/test2/XX:ASIAXXXXXXXXXXXXXXXX:1664688868
-		id = fmt.Sprintf("%s:%s:%s:%s:%d", i.Type, i.InvokedBy, i.Arn, i.AccessKeyId, i.SessionContext.Attributes.CreationDate.Unix())
-
-		//
-		// TODO: Cover ConsoleLogin from assume-role source. This is difficult because we can only identify the
-		//   resulting session based on the original session arn and the creation time, there is no access
-		//   key in there response. We also can't identify if the source should be a ConsoleLogin call.
-		//
-	case "AWSAccount":
-		// To actually reliably track sessions across accounts we need to use the sharedEventId.
-		//
-		// Can be in either of the following formats:
-		//   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX
-                //   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX:botocore-session-1661553185
-		id = fmt.Sprintf("%s:%s:%s", i.Type, i.AccountId, i.PrincipalId)
-	case "AWSService":
-		// Consolidate sessions that originate from AWS Services, they create too many unique sessions.
-		//
-		// AWSService:codepipeline.amazonaws.com
-		id = fmt.Sprintf("%s:%s", i.Type, i.InvokedBy)
-	case "FederatedUser":
-		// TODO: Ensure Source can match this
-		id = fmt.Sprintf("%s:%s:%s:%s:%d", i.Type, i.InvokedBy, i.Arn, i.AccessKeyId, i.SessionContext.Attributes.CreationDate.Unix())
-	default:
-		panic("unknown user identity type")
-
-	// AwsConsoleSignIn event type will not have a SessionContext
 ```
 
 ## Miscellaneous
