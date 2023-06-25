@@ -140,9 +140,11 @@ Both the above internal representation, and future events can then be reduced to
 
 With the original session key and target key a session stream will look like:
 
+```
 Event1.Id(): AWSAccount::<acct-id>:AIDA...
 Event1.Target(): AWSAccount::<acct-id>:AIDA... -> AssumedRole::<arn>:ASIA...:<unix timestamp>
 Event2.Id(): AssumedRole::<arn>:ASIA...:<unix timestamp>
+```
 
 ### SessionContext field
 
