@@ -60,6 +60,58 @@ iirc these files are supposed to track different identity type session changes. 
 referenced across all events which should corelate more or less to the principal or entity(?) as well as tracked edges between different principal/entity session keys
 as a result of a specific event log (assumerole, etc..).
 
+### SessionContext field
+
+```
+SessionContext is null when .userIdentity.type is
+
+     * Role
+     * SAMLUser
+     * WebIdentityUser
+     * AWSService
+     * null (`AwsServiceEvent` event type)
+
+   and sometimes when .userIdentity.type is (TODO: why?)
+     * IAMUser
+```
+
+### SessionIssuer field
+
+```
+// SessionIssuer provides information about how the credentials were obtained if the request was made with temporary
+// security credentials.
+//
+// https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-user-identity.html#sessionissuer
+//
+type SessionIssuer struct {
+	// Type can be
+	//  * Root
+	//  * IAMUser
+	//  * Role
+	Type string `json:"type"`
+
+	// PrincipalId the internal ID of the entity that was used to get credentials.
+	PrincipalId string `json:"principalId"`
+
+	// Arn the source (account, IAM user, or role) that was used to get temporary security credentials
+	Arn string `json:"arn"`
+
+	// AccountId is the account that owns the entity that was used to get credentials.
+	AccountId string `json:"accountId"`
+
+	// UserName
+	//
+	// The friendly name of the user or role that issued the session. The value that appears depends on the
+	// sessionIssuer identity type.
+	//
+	//   * Root w/no alias: nil
+	//   * Root w/alias: Account alias
+	//   * IAMUser: Name of user
+	//   * Role: Name of role
+	UserName string `json:"userName"`
+}
+```
+
 ### UserIdentity field
 
 This should correspond to the userIdentity key
@@ -126,9 +178,9 @@ type UserIdentity struct {
 	InvokedBy string `json:"invokedBy,omitempty"`
 
 	// PrincipalId
-	// A unique identifier for the entity that made the call. For requests made with temporary security credentials,
-	// this value includes the session name that is passed to the AssumeRole, AssumeRoleWithWebIdentity, or
-	// GetFederationToken API call.
+	//   A unique identifier for the entity that made the call. For requests made with temporary security credentials,
+	//   this value includes the session name that is passed to the AssumeRole, AssumeRoleWithWebIdentity, or
+	//   GetFederationToken API call.
 	//
 	//   Optional: True
 	//
@@ -231,7 +283,9 @@ type UserIdentity struct {
 	case "AWSAccount":
 		// To actually reliably track sessions across accounts we need to use the sharedEventId.
 		//
-		// AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX
+		// Can be in either of the following formats:
+		//   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX
+                //   AWSAccount::123456789012:AIDAXXXXXXXXXXXXXXXXX:botocore-session-1661553185
 		id = fmt.Sprintf("%s:%s:%s", i.Type, i.AccountId, i.PrincipalId)
 	case "AWSService":
 		// Consolidate sessions that originate from AWS Services, they create too many unique sessions.
@@ -245,4 +299,101 @@ type UserIdentity struct {
 		panic("unknown user identity type")
 
 	// AwsConsoleSignIn event type will not have a SessionContext
+```
+
+## Miscellaneous
+
+```
+type AwsServiceIdentity struct {
+	BaseUserIdentity
+	InvokedBy string `json:"invokedBy"`
+}
+
+type AwsAccountIdentity struct {
+	BaseUserIdentity
+
+	// PrincipalId is
+	//   * AIDA[A-Z2-7]{16} representing an IAM User.
+	//   * AROA[A-Z2-7]{16}:<sessionName> representing a role session.
+	PrincipalId string `json:"principalId"`
+	AccountId   string `json:"accountId"`
+
+	// Optional InvokedBy field so far only seen this set to "AWS Internal"
+	InvokedBy *string `json:"invokedBy"`
+}
+
+type RootIdentity struct {
+	BaseUserIdentity
+
+	// PrincipalId appears to be the account ID (or alias?)
+	PrincipalId string `json:"principalId"`
+
+	// UserName is the account alias if it is seet.
+	UserName *string `json:"userName"`
+
+	// Arn is the root ARN (arn:aws:iam::111111111111:root)
+	Arn       string `json:"arn"`
+	AccountId string `json:"accountId"`
+
+	// AccessKeyId appears to be a temporary token associated with the current account in some way.
+	//  * Using https://go.dev/play/p/-VgXwYUfRUC results in the current account ID.
+	//  * Haven't seen the same ID occur twice in the logs yet, so unclear atm how to associate this identity.
+	//  * It appears ASIA... ids relate to AROA... ids in some predictable way, may be able to use that.
+	AccessKeyId string `json:"accessKeyId"`
+
+	// SessionContext so far seems empty except the attributes object
+	SessionContext struct {
+		SessionIssuer       SessionIssuer `json:"sessionIssuer"`
+		WebIdFederationData struct {
+		} `json:"webIdFederationData"`
+		Attributes struct {
+			CreationDate     time.Time `json:"creationDate"`
+			MfaAuthenticated string    `json:"mfaAuthenticated"`
+		} `json:"attributes"`
+	} `json:"sessionContext"`
+}
+
+type UserIdentity struct {
+	BaseUserIdentity
+
+	PrincipalId    string `json:"principalId"`
+	Arn            string `json:"arn"`
+	AccountId      string `json:"accountId"`
+	AccessKeyId    string `json:"accessKeyId"`
+	UserName       string `json:"userName"`
+	SessionContext struct {
+		SessionIssuer struct {
+		} `json:"sessionIssuer"`
+		WebIdFederationData struct {
+		} `json:"webIdFederationData"`
+		Attributes struct {
+			CreationDate     time.Time `json:"creationDate"`
+			MfaAuthenticated string    `json:"mfaAuthenticated"`
+		} `json:"attributes"`
+	} `json:"sessionContext"`
+	InvokedBy string `json:"invokedBy"`
+}
+
+type AssumedRoleIdentity struct {
+	BaseUserIdentity
+
+	PrincipalId    string `json:"principalId"`
+	Arn            string `json:"arn"`
+	AccountId      string `json:"accountId"`
+	SessionContext struct {
+		SessionIssuer struct {
+			Type        string `json:"type"`
+			PrincipalId string `json:"principalId"`
+			Arn         string `json:"arn"`
+			AccountId   string `json:"accountId"`
+			UserName    string `json:"userName"`
+		} `json:"sessionIssuer"`
+		WebIdFederationData struct {
+		} `json:"webIdFederationData"`
+		Attributes struct {
+			CreationDate     time.Time `json:"creationDate"`
+			MfaAuthenticated string    `json:"mfaAuthenticated"`
+		} `json:"attributes"`
+	} `json:"sessionContext"`
+}
 ```
